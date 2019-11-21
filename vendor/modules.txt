@@ -1,0 +1,7 @@
+# github.com/google/gopacket v1.1.17
+github.com/google/gopacket
+github.com/google/gopacket/dumpcommand
+github.com/google/gopacket/examples/util
+github.com/google/gopacket/ip4defrag
+github.com/google/gopacket/layers
+github.com/google/gopacket/pcap
