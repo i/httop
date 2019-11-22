@@ -89,7 +89,9 @@ func isHTTPResponse(r *bufio.Reader) bool {
 	return err == nil && string(bb) == "HTTP"
 }
 
-func processRequests(r io.Reader, ch chan *http.Request) {
+func processRequests(r io.ReadCloser, ch chan *http.Request) {
+	defer r.Close()
+
 	buf := bufio.NewReader(r)
 	for {
 		req, err := http.ReadRequest(buf)
@@ -103,56 +105,30 @@ func processRequests(r io.Reader, ch chan *http.Request) {
 	}
 }
 
-// todo remove
-func handleUnexpectedResponse(r io.Reader) {
-	// log.Println("unexpected response!")
-	// log.Println("just returning")
+func handleUnexpectedResponse(r io.ReadCloser) {
+	// TODO any operation on r will block forever which blocks assembly for the
+	// rest of the streams.
 	return
-	buf := bufio.NewReader(r)
-	for {
-		log.Println("reading unexpected response...")
-		bb, err := ioutil.ReadAll(buf)
-		log.Println("...read it")
-		if err == io.EOF || (err == nil && len(bb) == 0) {
-			log.Println("empty unexpected response. exiting")
-			return
-		}
-		if err != nil {
-			log.Fatalf("Error reading http response: %v", err)
-		}
-		log.Printf("Unexpected response: %s", string(bb))
-	}
 }
 
-func processResponses(r io.Reader, ch chan *http.Request, roundTrips chan<- roundTripInfo) error {
-	buf := bufio.NewReader(r)
+func processResponses(r io.ReadCloser, ch chan *http.Request, roundTrips chan<- roundTripInfo) {
+	defer r.Close()
 	for {
-		bb, err := ioutil.ReadAll(buf)
-		if err == io.EOF || (err == nil && len(bb) == 0) {
-			return nil
-		}
-		if err != nil {
-			log.Fatalf("Error reading http response: %v", err)
-		}
-
-		var cw countWriter
+		responseSize := tcpreader.DiscardBytesToEOF(r)
 		request := <-ch
+		var cw countWriter
+
 		if err := request.Write(&cw); err != nil {
 			panic(err)
 		}
+
 		roundTrips <- roundTripInfo{
 			host:         request.Host,
 			path:         request.URL.String(),
 			requestSize:  int(cw),
-			responseSize: len(bb),
+			responseSize: responseSize,
 		}
 	}
-}
-
-type httpRequestResponse struct {
-	host    string
-	section string
-	size    string
 }
 
 type httpStreamFactory struct {
@@ -162,12 +138,16 @@ type httpStreamFactory struct {
 
 func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stream {
 	r := tcpreader.NewReaderStream()
+	r.ReaderStreamOptions = tcpreader.ReaderStreamOptions{
+		LossErrors: true,
+	}
 
 	// handle outgoing request
 	if tcpFlow.Dst().String() == "80" {
 		hostport := fmt.Sprintf("%s:%s", netFlow.Dst().String(), tcpFlow.Src().String())
-		ch := make(chan *http.Request, 1)
+		ch := make(chan *http.Request, 100)
 		s.pending[hostport] = ch
+		fmt.Println("put in", hostport)
 		go processRequests(&r, ch)
 		return &r
 	}
@@ -177,6 +157,7 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 		hostport := fmt.Sprintf("%s:%s", netFlow.Src().String(), tcpFlow.Dst().String())
 		ch, ok := s.pending[hostport]
 		if !ok {
+			fmt.Println("couldn't find", hostport)
 			handleUnexpectedResponse(&r)
 			return &r
 		}
@@ -184,7 +165,7 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 		return &r
 	}
 
-	panic("TODO: handle why we're here")
+	panic("this shouldn't happen")
 }
 
 func (s *Sniffer) Start() error {
@@ -196,34 +177,36 @@ func (s *Sniffer) Start() error {
 	handle.SetBPFFilter("tcp port 80") // TODO make this configurable
 	s.roundTrips = make(chan roundTripInfo, 1)
 	s.stats = make(map[string][]frame)
+
+	go s.displayLoop()
+	go s.processRoundTrips()
+	go s.getPackets(handle)
+
+	return nil
+}
+
+func (s *Sniffer) getPackets(h *pcap.Handle) {
 	streamFactory := &httpStreamFactory{
 		pending:    make(map[string]chan *http.Request),
 		roundTrips: s.roundTrips,
 	}
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-
-	go func() {
-		packets := packetSource.Packets()
-		for {
-			select {
-			case <-s.stopReporting:
-				// TODO cleanup?
-				return
-			case packet := <-packets:
-				tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP)
-				if !ok {
-					continue
-				}
-				assembler.Assemble(packet.NetworkLayer().NetworkFlow(), tcp)
+	packetSource := gopacket.NewPacketSource(h, h.LinkType())
+	packets := packetSource.Packets()
+	for {
+		select {
+		case <-s.stopReporting:
+			// TODO cleanup?
+			return
+		case packet := <-packets:
+			tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP)
+			if !ok {
+				continue
 			}
+			assembler.Assemble(packet.NetworkLayer().NetworkFlow(), tcp)
 		}
-	}()
-	go s.displayLoop()
-	go s.processRoundTrips()
-
-	return nil
+	}
 }
 
 // not threadsafe
@@ -291,13 +274,15 @@ func (s *Sniffer) ShowDisplay() {
 				displayTotal += displayUp + displayDown
 			}
 		}
-		rows = append(rows, displayRow{
-			Section: section,
-			Hits:    displayHits,
-			Up:      displayUp,
-			Down:    displayDown,
-			Total:   displayTotal,
-		})
+		if displayHits > 0 {
+			rows = append(rows, displayRow{
+				Section: section,
+				Hits:    displayHits,
+				Up:      displayUp,
+				Down:    displayDown,
+				Total:   displayTotal,
+			})
+		}
 	}
 
 	sort.Slice(rows, func(i, j int) bool {
