@@ -32,13 +32,19 @@ func defaultIface() string {
 }
 
 func main() {
+	go startDebugServer()
+
 	sniffer := &Sniffer{
 		Ports:          []uint16{80},
 		ReportInterval: time.Second * 5,
 	}
 
-	go startDebugServer()
-	sniffer.Start()
+	if err := sniffer.Start(); err != nil {
+		log.Fatal(err)
+	}
+
+	select {}
+
 }
 
 func startDebugServer() {
@@ -46,14 +52,29 @@ func startDebugServer() {
 	go http.ListenAndServe(":8080", nil)
 }
 
+type countWriter int64
+
+func (cw *countWriter) Write(p []byte) (int, error) {
+	n, err := ioutil.Discard.Write(p)
+	*cw += countWriter(n)
+	return n, err
+}
+
 type Sniffer struct {
 	Interface      string
 	Ports          []uint16
 	ReportInterval time.Duration
 
+	roundTrips    chan roundTripInfo
 	address       []string
-	data          map[string]interface{}
 	stopReporting chan struct{}
+}
+
+type roundTripInfo struct {
+	host         string
+	path         string
+	requestSize  int
+	responseSize int
 }
 
 func isHTTPResponse(r *bufio.Reader) bool {
@@ -65,23 +86,18 @@ func isHTTPResponse(r *bufio.Reader) bool {
 func processRequests(r io.Reader, ch chan *http.Request) {
 	buf := bufio.NewReader(r)
 	for {
-		fmt.Println(66)
 		req, err := http.ReadRequest(buf)
-		fmt.Println(69)
 		if err == io.EOF {
 			return
 		}
 		if err != nil {
 			panic(err)
 		}
-
-		fmt.Println("putting it in")
 		ch <- req
-		fmt.Println("put it in")
 	}
 }
 
-func processResponses(r io.Reader, ch chan *http.Request) error {
+func processResponses(r io.Reader, ch chan *http.Request, roundTrips chan<- roundTripInfo) error {
 	buf := bufio.NewReader(r)
 	for {
 		bb, err := ioutil.ReadAll(buf)
@@ -91,10 +107,14 @@ func processResponses(r io.Reader, ch chan *http.Request) error {
 		if err != nil {
 			log.Fatalf("Error reading http response: %v", err)
 		}
-		// fmt.Println(string(bb))
-		fmt.Printf("Response body contains: %v bytes\n", len(bb))
 		request := <-ch
-		fmt.Println("SUCCESS", request)
+		_ = request
+		roundTrips <- roundTripInfo{
+			host:         request.Host,
+			path:         request.URL.String(),
+			requestSize:  4,
+			responseSize: 20,
+		}
 	}
 }
 
@@ -105,7 +125,8 @@ type httpRequestResponse struct {
 }
 
 type httpStreamFactory struct {
-	pending map[string]chan *http.Request
+	pending    map[string]chan *http.Request
+	roundTrips chan roundTripInfo
 }
 
 func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stream {
@@ -113,24 +134,21 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 
 	// handle outgoing request
 	if tcpFlow.Dst().String() == "80" {
+		hostport := fmt.Sprintf("%s:%s", netFlow.Dst().String(), tcpFlow.Src().String())
 		ch := make(chan *http.Request, 1)
-
-		host := netFlow.Dst().String()
-		port := tcpFlow.Src().String()
-		s.pending[fmt.Sprintf("%s:%s", host, port)] = ch
+		s.pending[hostport] = ch
 		go processRequests(&r, ch)
 		return &r
 	}
 
 	// handle response
 	if tcpFlow.Src().String() == "80" {
-		host := netFlow.Src().String()
-		port := tcpFlow.Dst().String()
-		ch, ok := s.pending[fmt.Sprintf("%s:%s", host, port)]
+		hostport := fmt.Sprintf("%s:%s", netFlow.Src().String(), tcpFlow.Dst().String())
+		ch, ok := s.pending[hostport]
 		if !ok {
 			log.Fatal("no corresponding request for this response")
 		}
-		go processResponses(&r, ch)
+		go processResponses(&r, ch, s.roundTrips)
 		return &r
 	}
 
@@ -142,23 +160,43 @@ func (s *Sniffer) Start() error {
 	if err != nil {
 		return fmt.Errorf("error opening packet stream: %w", err)
 	}
-	handle.SetBPFFilter("tcp port 80")
 
-	// go s.displayLoop()
-
-	streamFactory := &httpStreamFactory{pending: make(map[string]chan *http.Request)}
+	handle.SetBPFFilter("tcp port 80") // TODO make this configurable
+	s.roundTrips = make(chan roundTripInfo, 1)
+	streamFactory := &httpStreamFactory{
+		pending:    make(map[string]chan *http.Request),
+		roundTrips: s.roundTrips,
+	}
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
-
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	for packet := range packetSource.Packets() {
-		tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP)
-		if !ok {
-			continue
+
+	go func() {
+		packets := packetSource.Packets()
+		for {
+			select {
+			case <-s.stopReporting:
+				// TODO cleanup?
+				return
+			case packet := <-packets:
+				tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP)
+				if !ok {
+					continue
+				}
+				assembler.Assemble(packet.NetworkLayer().NetworkFlow(), tcp)
+			}
 		}
-		assembler.Assemble(packet.NetworkLayer().NetworkFlow(), tcp)
-	}
+	}()
+	go s.displayLoop()
+	go s.processRoundTrips()
+
 	return nil
+}
+
+func (s *Sniffer) processRoundTrips() {
+	for rt := range s.roundTrips {
+		fmt.Println("round trip info:", rt)
+	}
 }
 
 func (s *Sniffer) displayLoop() {
