@@ -64,7 +64,9 @@ type Sniffer struct {
 	Interface      string
 	Ports          []uint16
 	ReportInterval time.Duration
+	AlertThreshold int
 
+	displayTick   chan struct{}
 	roundTrips    chan roundTripInfo
 	stats         map[string][]frame
 	stopReporting chan struct{}
@@ -168,6 +170,7 @@ func (s *Sniffer) Start() error {
 
 	handle.SetBPFFilter("tcp port 80") // TODO make this configurable
 	s.roundTrips = make(chan roundTripInfo, 1)
+	s.displayTick = make(chan struct{}, 1)
 	s.stats = make(map[string][]frame)
 
 	go s.displayLoop()
@@ -210,7 +213,7 @@ func (s *Sniffer) processRoundTrips() {
 			up:   rt.requestSize,
 			down: rt.responseSize,
 		})
-		s.ShowDisplay()
+		s.displayTick <- struct{}{}
 	}
 }
 
@@ -226,6 +229,8 @@ func (s *Sniffer) displayLoop() {
 		case <-s.stopReporting:
 			t.Stop()
 			return
+		case <-s.displayTick:
+			s.ShowDisplay()
 		case <-t.C:
 			s.ShowDisplay()
 		}
@@ -270,6 +275,19 @@ func (s *Sniffer) ShowDisplay() {
 				displayTotal += displayUp + displayDown
 			}
 		}
+
+		if alertHits > s.AlertThreshold {
+			rows = append(rows, display.Row{
+				Section: section,
+				Hits:    displayHits,
+				Up:      displayUp,
+				Down:    displayDown,
+				Total:   displayTotal,
+				Alert:   true,
+			})
+			continue
+		}
+
 		if displayHits > 0 {
 			rows = append(rows, display.Row{
 				Section: section,

@@ -25,7 +25,7 @@ func Update(rows []Row) {
 	table.Rows = table.Rows[:1]
 	for i, row := range rows {
 		table.Rows = append(table.Rows, []string{
-			row.Section,
+			" " + row.Section + " ",
 			strconv.Itoa(row.Hits),
 			strconv.Itoa(row.Total),
 			strconv.Itoa(row.Down),
@@ -33,7 +33,7 @@ func Update(rows []Row) {
 		})
 		table.RowStyles[i] = ui.NewStyle(ui.ColorWhite, ui.ColorBlack, ui.ModifierBold)
 		if row.Alert {
-			table.RowStyles[1] = ui.NewStyle(ui.ColorWhite, ui.ColorRed, ui.ModifierBold)
+			table.RowStyles[i] = ui.NewStyle(ui.ColorWhite, ui.ColorRed, ui.ModifierBold)
 		}
 	}
 	ui.Render(table)
