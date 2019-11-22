@@ -9,9 +9,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
+
+	"datadog-project/display"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -44,7 +45,6 @@ func main() {
 	}
 
 	select {}
-
 }
 
 func startDebugServer() {
@@ -81,12 +81,6 @@ type roundTripInfo struct {
 	path         string
 	requestSize  int
 	responseSize int
-}
-
-func isHTTPResponse(r *bufio.Reader) bool {
-	bb, err := r.Peek(4)
-	fmt.Println(err, string(bb))
-	return err == nil && string(bb) == "HTTP"
 }
 
 func processRequests(r io.ReadCloser, ch chan *http.Request) {
@@ -147,7 +141,6 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 		hostport := fmt.Sprintf("%s:%s", netFlow.Dst().String(), tcpFlow.Src().String())
 		ch := make(chan *http.Request, 100)
 		s.pending[hostport] = ch
-		fmt.Println("put in", hostport)
 		go processRequests(&r, ch)
 		return &r
 	}
@@ -157,7 +150,6 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 		hostport := fmt.Sprintf("%s:%s", netFlow.Src().String(), tcpFlow.Dst().String())
 		ch, ok := s.pending[hostport]
 		if !ok {
-			fmt.Println("couldn't find", hostport)
 			handleUnexpectedResponse(&r)
 			return &r
 		}
@@ -223,6 +215,10 @@ func (s *Sniffer) processRoundTrips() {
 }
 
 func (s *Sniffer) displayLoop() {
+	if err := display.Init(); err != nil {
+		log.Fatal(err)
+	}
+
 	s.stopReporting = make(chan struct{})
 	t := time.NewTicker(s.ReportInterval)
 	for {
@@ -241,7 +237,7 @@ func (s *Sniffer) ShowDisplay() {
 	showTS := now.Add(-time.Second * 5)
 	alertTS := now.Add(-time.Second * 10) // TODO make this 2 minutes or configurable
 
-	var rows []displayRow
+	var rows []display.Row
 
 	for section, frames := range s.stats {
 		if len(frames) == 0 {
@@ -275,7 +271,7 @@ func (s *Sniffer) ShowDisplay() {
 			}
 		}
 		if displayHits > 0 {
-			rows = append(rows, displayRow{
+			rows = append(rows, display.Row{
 				Section: section,
 				Hits:    displayHits,
 				Up:      displayUp,
@@ -285,20 +281,7 @@ func (s *Sniffer) ShowDisplay() {
 		}
 	}
 
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].Hits > rows[j].Hits
-	})
-	for _, row := range rows {
-		fmt.Println(row)
-	}
-}
-
-type displayRow struct {
-	Section string
-	Hits    int
-	Up      int
-	Down    int
-	Total   int
+	display.Update(rows)
 }
 
 func sectionFromHostPath(host, path string) string {

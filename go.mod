@@ -3,6 +3,7 @@ module datadog-project
 go 1.13
 
 require (
+	github.com/gizak/termui/v3 v3.1.0
 	github.com/google/gopacket v1.1.17
 	github.com/jroimartin/gocui v0.4.0
 	github.com/mattn/go-runewidth v0.0.6 // indirect
