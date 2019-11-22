@@ -7,7 +7,9 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 
@@ -21,7 +23,7 @@ import (
 // backup default interface for darwin
 const _defaultIface = "en0"
 
-func defaultDevice() string {
+func defaultIface() string {
 	devs, err := pcap.FindAllDevs()
 	if err != nil || len(devs) == 0 {
 		return _defaultIface
@@ -35,7 +37,13 @@ func main() {
 		ReportInterval: time.Second * 5,
 	}
 
+	go startDebugServer()
 	sniffer.Start()
+}
+
+func startDebugServer() {
+	runtime.SetBlockProfileRate(1)
+	go http.ListenAndServe(":8080", nil)
 }
 
 type Sniffer struct {
@@ -43,56 +51,102 @@ type Sniffer struct {
 	Ports          []uint16
 	ReportInterval time.Duration
 
+	address       []string
 	data          map[string]interface{}
 	stopReporting chan struct{}
 }
 
-type httpStreamFactory struct{}
-
 func isHTTPResponse(r *bufio.Reader) bool {
 	bb, err := r.Peek(4)
+	fmt.Println(err, string(bb))
 	return err == nil && string(bb) == "HTTP"
 }
 
-func (s *Sniffer) processRequests(r io.Reader) {
+func processRequests(r io.Reader, ch chan *http.Request) {
 	buf := bufio.NewReader(r)
 	for {
-		if isHTTPResponse(buf) {
-			bb, err := ioutil.ReadAll(buf)
-			if err != nil {
-				log.Fatalf("Error reading http response: %v", err)
-			}
-			fmt.Println(string(bb))
-			fmt.Printf("Response body contains: %v bytes\n", len(bb))
-			continue
-		}
+		fmt.Println(66)
 		req, err := http.ReadRequest(buf)
-		if err != nil {
-			return
-		}
+		fmt.Println(69)
 		if err == io.EOF {
 			return
 		}
-		fmt.Printf("HTTP REQUEST: %+v", req)
-		fmt.Println("Body contains", tcpreader.DiscardBytesToEOF(req.Body), "bytes")
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println("putting it in")
+		ch <- req
+		fmt.Println("put it in")
 	}
 }
 
-func (s *httpStreamFactory) New(a, b gopacket.Flow) tcpassembly.Stream {
+func processResponses(r io.Reader, ch chan *http.Request) error {
+	buf := bufio.NewReader(r)
+	for {
+		bb, err := ioutil.ReadAll(buf)
+		if err == io.EOF || (err == nil && len(bb) == 0) {
+			return nil
+		}
+		if err != nil {
+			log.Fatalf("Error reading http response: %v", err)
+		}
+		// fmt.Println(string(bb))
+		fmt.Printf("Response body contains: %v bytes\n", len(bb))
+		request := <-ch
+		fmt.Println("SUCCESS", request)
+	}
+}
+
+type httpRequestResponse struct {
+	host    string
+	section string
+	size    string
+}
+
+type httpStreamFactory struct {
+	pending map[string]chan *http.Request
+}
+
+func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stream {
 	r := tcpreader.NewReaderStream()
-	go processRequests(&r)
-	return &r
+
+	// handle outgoing request
+	if tcpFlow.Dst().String() == "80" {
+		ch := make(chan *http.Request, 1)
+
+		host := netFlow.Dst().String()
+		port := tcpFlow.Src().String()
+		s.pending[fmt.Sprintf("%s:%s", host, port)] = ch
+		go processRequests(&r, ch)
+		return &r
+	}
+
+	// handle response
+	if tcpFlow.Src().String() == "80" {
+		host := netFlow.Src().String()
+		port := tcpFlow.Dst().String()
+		ch, ok := s.pending[fmt.Sprintf("%s:%s", host, port)]
+		if !ok {
+			log.Fatal("no corresponding request for this response")
+		}
+		go processResponses(&r, ch)
+		return &r
+	}
+
+	panic("TODO: handle why we're here")
 }
 
 func (s *Sniffer) Start() error {
-	handle, err := pcap.OpenLive(defaultDevice(), 1600, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(defaultIface(), 1600, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("error opening packet stream: %w", err)
 	}
+	handle.SetBPFFilter("tcp port 80")
 
-	go s.displayLoop()
+	// go s.displayLoop()
 
-	streamFactory := &httpStreamFactory{}
+	streamFactory := &httpStreamFactory{pending: make(map[string]chan *http.Request)}
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
 
@@ -102,9 +156,7 @@ func (s *Sniffer) Start() error {
 		if !ok {
 			continue
 		}
-
-		assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
-
+		assembler.Assemble(packet.NetworkLayer().NetworkFlow(), tcp)
 	}
 	return nil
 }
