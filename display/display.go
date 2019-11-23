@@ -13,29 +13,41 @@ var table *widgets.Table
 type Row struct {
 	Section string
 	Hits    int
-	Up      int
 	Down    int
+	Up      int
 	Total   int
 	Alert   bool
 }
 
+func (r Row) String() string {
+	return fmt.Sprintf("%s\t%d\t%d\t%d\t%d",
+		r.Section,
+		r.Hits,
+		r.Down,
+		r.Up,
+		r.Total)
+}
+
 func Update(rows []Row) {
-	w, h := ui.TerminalDimensions()
-	table.SetRect(0, 0, w, h)
+	// preserve headers
 	table.Rows = table.Rows[:1]
+
 	for i, row := range rows {
 		table.Rows = append(table.Rows, []string{
-			" " + row.Section + " ",
+			row.Section,
 			strconv.Itoa(row.Hits),
 			strconv.Itoa(row.Total),
 			strconv.Itoa(row.Down),
 			strconv.Itoa(row.Up),
 		})
-		table.RowStyles[i] = ui.NewStyle(ui.ColorWhite, ui.ColorBlack, ui.ModifierBold)
+		table.RowStyles[i+1] = ui.NewStyle(ui.ColorWhite, ui.ColorBlack, ui.ModifierBold)
 		if row.Alert {
-			table.RowStyles[i] = ui.NewStyle(ui.ColorWhite, ui.ColorRed, ui.ModifierBold)
+			table.RowStyles[i+1] = ui.NewStyle(ui.ColorWhite, ui.ColorRed, ui.ModifierBold)
 		}
 	}
+
+	w, h := ui.TerminalDimensions()
+	table.SetRect(0, 0, w, h)
 	ui.Render(table)
 }
 

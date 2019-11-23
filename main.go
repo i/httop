@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +24,35 @@ import (
 	"github.com/google/gopacket/tcpassembly/tcpreader"
 )
 
+var (
+	port           = flag.Int("port", 80, "Port for which to monitor http traffic")
+	displayWindow  = flag.Duration("displayWindow", 10*time.Second, "Size of sliding window to show stats")
+	alertWindow    = flag.Duration("alertwindow", 2*time.Minute, "Size of sliding window to alert on")
+	alertThreshold = flag.Int("alertThreshold", 100, "Alert on number of hits when this threshold exceeded")
+	gui            = flag.Bool("gui", false, "Whether or not to enable full screen mode")
+)
+
+func main() {
+	flag.Parse()
+
+	go startDebugServer()
+
+	sniffer := &Sniffer{
+		Port:           uint16(*port),
+		ReportInterval: *displayWindow,
+		DisplayWindow:  *displayWindow,
+		AlertThreshold: *alertThreshold,
+		AlertWindow:    *alertWindow,
+		GUIEnabled:     *gui,
+	}
+
+	if err := sniffer.Start(); err != nil {
+		log.Fatal(err)
+	}
+
+	select {}
+}
+
 // backup default interface for darwin
 const _defaultIface = "en0"
 
@@ -30,21 +62,6 @@ func defaultIface() string {
 		return _defaultIface
 	}
 	return devs[0].Name
-}
-
-func main() {
-	go startDebugServer()
-
-	sniffer := &Sniffer{
-		Ports:          []uint16{80},
-		ReportInterval: time.Second * 5,
-	}
-
-	if err := sniffer.Start(); err != nil {
-		log.Fatal(err)
-	}
-
-	select {}
 }
 
 func startDebugServer() {
@@ -62,9 +79,12 @@ func (cw *countWriter) Write(p []byte) (int, error) {
 
 type Sniffer struct {
 	Interface      string
-	Ports          []uint16
+	Port           uint16
 	ReportInterval time.Duration
 	AlertThreshold int
+	AlertWindow    time.Duration
+	DisplayWindow  time.Duration
+	GUIEnabled     bool
 
 	displayTick   chan struct{}
 	roundTrips    chan roundTripInfo
@@ -130,6 +150,7 @@ func processResponses(r io.ReadCloser, ch chan *http.Request, roundTrips chan<- 
 type httpStreamFactory struct {
 	pending    map[string]chan *http.Request
 	roundTrips chan roundTripInfo
+	port       string
 }
 
 func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stream {
@@ -139,16 +160,15 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 	}
 
 	// handle outgoing request
-	if tcpFlow.Dst().String() == "80" {
+	if tcpFlow.Dst().String() == s.port {
 		hostport := fmt.Sprintf("%s:%s", netFlow.Dst().String(), tcpFlow.Src().String())
 		ch := make(chan *http.Request, 100)
 		s.pending[hostport] = ch
 		go processRequests(&r, ch)
-		return &r
 	}
 
 	// handle response
-	if tcpFlow.Src().String() == "80" {
+	if tcpFlow.Src().String() == s.port {
 		hostport := fmt.Sprintf("%s:%s", netFlow.Src().String(), tcpFlow.Dst().String())
 		ch, ok := s.pending[hostport]
 		if !ok {
@@ -156,19 +176,25 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 			return &r
 		}
 		go processResponses(&r, ch, s.roundTrips)
-		return &r
 	}
 
-	panic("this shouldn't happen")
+	return &r
 }
 
+// Start is the main entrypoint for a sniffer
 func (s *Sniffer) Start() error {
+	if s.GUIEnabled {
+		if err := display.Init(); err != nil {
+			return fmt.Errorf("error initializing GUI: %v", err)
+		}
+	}
+
 	handle, err := pcap.OpenLive(defaultIface(), 1600, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("error opening packet stream: %w", err)
 	}
 
-	handle.SetBPFFilter("tcp port 80") // TODO make this configurable
+	handle.SetBPFFilter(fmt.Sprintf("tcp port %v", s.Port))
 	s.roundTrips = make(chan roundTripInfo, 1)
 	s.displayTick = make(chan struct{}, 1)
 	s.stats = make(map[string][]frame)
@@ -182,6 +208,7 @@ func (s *Sniffer) Start() error {
 
 func (s *Sniffer) getPackets(h *pcap.Handle) {
 	streamFactory := &httpStreamFactory{
+		port:       strconv.Itoa(int(s.Port)),
 		pending:    make(map[string]chan *http.Request),
 		roundTrips: s.roundTrips,
 	}
@@ -189,8 +216,12 @@ func (s *Sniffer) getPackets(h *pcap.Handle) {
 	assembler := tcpassembly.NewAssembler(streamPool)
 	packetSource := gopacket.NewPacketSource(h, h.LinkType())
 	packets := packetSource.Packets()
+
+	t := time.NewTicker(time.Second * 5)
 	for {
 		select {
+		case <-t.C:
+			assembler.FlushWithOptions(tcpassembly.FlushOptions{CloseAll: true})
 		case <-s.stopReporting:
 			// TODO cleanup?
 			return
@@ -213,15 +244,14 @@ func (s *Sniffer) processRoundTrips() {
 			up:   rt.requestSize,
 			down: rt.responseSize,
 		})
-		s.displayTick <- struct{}{}
+
+		if s.GUIEnabled {
+			s.displayTick <- struct{}{}
+		}
 	}
 }
 
 func (s *Sniffer) displayLoop() {
-	if err := display.Init(); err != nil {
-		log.Fatal(err)
-	}
-
 	s.stopReporting = make(chan struct{})
 	t := time.NewTicker(s.ReportInterval)
 	for {
@@ -230,19 +260,29 @@ func (s *Sniffer) displayLoop() {
 			t.Stop()
 			return
 		case <-s.displayTick:
-			s.ShowDisplay()
+			s.showDisplay()
 		case <-t.C:
-			s.ShowDisplay()
+			s.showDisplay()
 		}
 	}
 }
 
-func (s *Sniffer) ShowDisplay() {
-	now := time.Now()
-	showTS := now.Add(-time.Second * 5)
-	alertTS := now.Add(-time.Second * 10) // TODO make this 2 minutes or configurable
+func (s *Sniffer) showDisplay() {
+	rows := s.collectStats()
+	if s.GUIEnabled {
+		display.Update(rows)
+	} else {
+		for _, r := range rows {
+			fmt.Println(r)
+		}
+	}
+}
 
-	var rows []display.Row
+func (s *Sniffer) collectStats() []display.Row {
+	now := time.Now()
+	displayEpoch := now.Add(-s.DisplayWindow)
+	alertEpoch := now.Add(-s.AlertWindow)
+	rows := make([]display.Row, 0, len(s.stats))
 
 	for section, frames := range s.stats {
 		if len(frames) == 0 {
@@ -257,7 +297,7 @@ func (s *Sniffer) ShowDisplay() {
 			i = len(frames) - 1 - i
 			f := frames[i]
 
-			if f.ts.Before(alertTS) {
+			if f.ts.Before(alertEpoch) {
 				// remove this and all the frames preceding it
 				s.stats[section] = frames[i+1:]
 				break
@@ -268,7 +308,7 @@ func (s *Sniffer) ShowDisplay() {
 			alertDown += f.down
 			alertTotal += alertUp + alertDown
 
-			if f.ts.After(showTS) {
+			if f.ts.After(displayEpoch) {
 				displayHits++
 				displayUp += f.up
 				displayDown += f.down
@@ -276,30 +316,29 @@ func (s *Sniffer) ShowDisplay() {
 			}
 		}
 
+		row := display.Row{
+			Section: section,
+			Hits:    displayHits,
+			Up:      displayUp,
+			Down:    displayDown,
+			Total:   displayTotal,
+		}
+
 		if alertHits > s.AlertThreshold {
-			rows = append(rows, display.Row{
-				Section: section,
-				Hits:    displayHits,
-				Up:      displayUp,
-				Down:    displayDown,
-				Total:   displayTotal,
-				Alert:   true,
-			})
+			row.Alert = true
+			rows = append(rows, row)
 			continue
 		}
 
 		if displayHits > 0 {
-			rows = append(rows, display.Row{
-				Section: section,
-				Hits:    displayHits,
-				Up:      displayUp,
-				Down:    displayDown,
-				Total:   displayTotal,
-			})
+			rows = append(rows, row)
 		}
 	}
 
-	display.Update(rows)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Hits > rows[j].Hits })
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Alert && !rows[j].Alert })
+	return rows
+
 }
 
 func sectionFromHostPath(host, path string) string {
