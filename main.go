@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"datadog-project/display"
@@ -25,17 +26,21 @@ import (
 )
 
 var (
+	iface          = flag.String("iface", "", "Device for which to monitor traffic")
 	port           = flag.Int("port", 80, "Port for which to monitor http traffic")
 	displayWindow  = flag.Duration("displayWindow", 10*time.Second, "Size of sliding window to show stats")
-	alertWindow    = flag.Duration("alertwindow", 2*time.Minute, "Size of sliding window to alert on")
+	alertWindow    = flag.Duration("alertWindow", 2*time.Minute, "Size of sliding window to alert on")
 	alertThreshold = flag.Int("alertThreshold", 100, "Alert on number of hits when this threshold exceeded")
 	gui            = flag.Bool("gui", false, "Whether or not to enable full screen mode")
+	debug          = flag.Bool("debug", false, "Whether or not to mount pprof endpoints for debugging")
 )
 
 func main() {
 	flag.Parse()
 
-	go startDebugServer()
+	if *debug {
+		go startDebugServer()
+	}
 
 	sniffer := &Sniffer{
 		Port:           uint16(*port),
@@ -46,22 +51,19 @@ func main() {
 		GUIEnabled:     *gui,
 	}
 
-	if err := sniffer.Start(); err != nil {
+	if err := sniffer.Start(*iface, uint16(*port)); err != nil {
 		log.Fatal(err)
 	}
 
 	select {}
 }
 
-// backup default interface for darwin
-const _defaultIface = "en0"
-
-func defaultIface() string {
+func defaultIface() (string, error) {
 	devs, err := pcap.FindAllDevs()
 	if err != nil || len(devs) == 0 {
-		return _defaultIface
+		return "", err
 	}
-	return devs[0].Name
+	return devs[0].Name, nil
 }
 
 func startDebugServer() {
@@ -86,16 +88,14 @@ type Sniffer struct {
 	DisplayWindow  time.Duration
 	GUIEnabled     bool
 
+	display       display.Display
 	displayTick   chan struct{}
 	roundTrips    chan roundTripInfo
-	stats         map[string][]frame
 	stopReporting chan struct{}
-}
 
-type frame struct {
-	ts   time.Time
-	up   int
-	down int
+	stats map[string][]roundTripInfo
+
+	sync.Mutex
 }
 
 type roundTripInfo struct {
@@ -103,6 +103,7 @@ type roundTripInfo struct {
 	path         string
 	requestSize  int
 	responseSize int
+	timestamp    time.Time
 }
 
 func processRequests(r io.ReadCloser, ch chan *http.Request) {
@@ -115,7 +116,9 @@ func processRequests(r io.ReadCloser, ch chan *http.Request) {
 			return
 		}
 		if err != nil {
-			panic(err)
+			// possible malformed http request
+			tcpreader.DiscardBytesToEOF(r)
+			return
 		}
 		ch <- req
 	}
@@ -129,8 +132,14 @@ func handleUnexpectedResponse(r io.ReadCloser) {
 
 func processResponses(r io.ReadCloser, ch chan *http.Request, roundTrips chan<- roundTripInfo) {
 	defer r.Close()
+
+	buf := bufio.NewReader(r)
 	for {
-		responseSize := tcpreader.DiscardBytesToEOF(r)
+		cw1, err := buf.WriteTo(ioutil.Discard)
+		if err != nil {
+			panic(err)
+		}
+
 		request := <-ch
 		var cw countWriter
 
@@ -142,7 +151,8 @@ func processResponses(r io.ReadCloser, ch chan *http.Request, roundTrips chan<- 
 			host:         request.Host,
 			path:         request.URL.String(),
 			requestSize:  int(cw),
-			responseSize: responseSize,
+			responseSize: int(cw1),
+			timestamp:    time.Now(),
 		}
 	}
 }
@@ -182,24 +192,37 @@ func (s *httpStreamFactory) New(netFlow, tcpFlow gopacket.Flow) tcpassembly.Stre
 }
 
 // Start is the main entrypoint for a sniffer
-func (s *Sniffer) Start() error {
+func (s *Sniffer) Start(iface string, port uint16) error {
 	if s.GUIEnabled {
-		if err := display.Init(); err != nil {
+		disp, err := display.NewGUI(display.Options{DisplayWindow: s.DisplayWindow, AlertWindow: s.AlertWindow})
+		if err != nil {
 			return fmt.Errorf("error initializing GUI: %v", err)
 		}
+		s.display = disp
+	} else {
+		s.display = display.NewText(display.Options{DisplayWindow: s.DisplayWindow, AlertWindow: s.AlertWindow})
 	}
 
-	handle, err := pcap.OpenLive(defaultIface(), 1600, true, pcap.BlockForever)
+	if iface == "" {
+		i, err := defaultIface()
+		if err != nil {
+			log.Fatalf("Unable to list devices: %v", err)
+		}
+		iface = i
+	}
+
+	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("error opening packet stream: %w", err)
 	}
 
-	handle.SetBPFFilter(fmt.Sprintf("tcp port %v", s.Port))
+	handle.SetBPFFilter(fmt.Sprintf("tcp port %d", s.Port))
 	s.roundTrips = make(chan roundTripInfo, 1)
 	s.displayTick = make(chan struct{}, 1)
-	s.stats = make(map[string][]frame)
+	s.stats = make(map[string][]roundTripInfo)
 
 	go s.displayLoop()
+	go s.startDisplayTimer()
 	go s.processRoundTrips()
 	go s.getPackets(handle)
 
@@ -235,15 +258,14 @@ func (s *Sniffer) getPackets(h *pcap.Handle) {
 	}
 }
 
-// not threadsafe
 func (s *Sniffer) processRoundTrips() {
 	for rt := range s.roundTrips {
 		section := sectionFromHostPath(rt.host, rt.path)
-		s.stats[section] = append(s.stats[section], frame{
-			ts:   time.Now(),
-			up:   rt.requestSize,
-			down: rt.responseSize,
-		})
+
+		s.Lock()
+		s.stats[section] = append(s.stats[section], rt)
+		s.trimStats(section)
+		s.Unlock()
 
 		if s.GUIEnabled {
 			s.displayTick <- struct{}{}
@@ -251,94 +273,101 @@ func (s *Sniffer) processRoundTrips() {
 	}
 }
 
-func (s *Sniffer) displayLoop() {
-	s.stopReporting = make(chan struct{})
-	t := time.NewTicker(s.ReportInterval)
-	for {
-		select {
-		case <-s.stopReporting:
-			t.Stop()
+func (s *Sniffer) trimStats(section string) {
+	stats := s.stats[section]
+	alertEpoch := time.Now().Add(-s.AlertWindow)
+	for i := range stats {
+		f := stats[len(stats)-1-i]
+		if f.timestamp.Before(alertEpoch) {
+			s.stats[section] = stats[len(stats)-1-i:]
 			return
-		case <-s.displayTick:
-			s.showDisplay()
-		case <-t.C:
-			s.showDisplay()
 		}
+	}
+}
+
+func (s *Sniffer) startDisplayTimer() {
+	t := time.NewTicker(s.ReportInterval)
+	for range t.C {
+		s.displayTick <- struct{}{}
+	}
+}
+
+func (s *Sniffer) displayLoop() {
+	for range s.displayTick {
+		s.showDisplay()
 	}
 }
 
 func (s *Sniffer) showDisplay() {
-	rows := s.collectStats()
-	if s.GUIEnabled {
-		display.Update(rows)
-	} else {
-		for _, r := range rows {
-			fmt.Println(r)
-		}
-	}
+	stats := s.collectStats()
+	s.display.Update(stats.Global, stats.Sections)
 }
 
-func (s *Sniffer) collectStats() []display.Row {
+type Stats struct {
+	Global   display.Row
+	Sections []display.Row
+}
+
+func (s *Sniffer) collectStats() Stats {
 	now := time.Now()
 	displayEpoch := now.Add(-s.DisplayWindow)
 	alertEpoch := now.Add(-s.AlertWindow)
 	rows := make([]display.Row, 0, len(s.stats))
 
 	for section, frames := range s.stats {
-		if len(frames) == 0 {
-			// TODO make this threadsafe
-			delete(s.stats, section)
-			continue
-		}
-
-		var displayHits, displayUp, displayDown, displayTotal, alertHits, alertUp, alertDown, alertTotal int
+		row := display.Row{Section: section}
 		for i := range frames {
-			// this is just iterating backwards
-			i = len(frames) - 1 - i
-			f := frames[i]
+			f := frames[len(frames)-1-i]
 
-			if f.ts.Before(alertEpoch) {
-				// remove this and all the frames preceding it
-				s.stats[section] = frames[i+1:]
+			if f.timestamp.Before(alertEpoch) {
 				break
 			}
 
-			alertHits++
-			alertUp += f.up
-			alertDown += f.down
-			alertTotal += alertUp + alertDown
+			row.AlertHits++
+			row.AlertUp += f.requestSize
+			row.AlertDown += f.responseSize
+			row.AlertTotal += row.AlertUp + row.AlertDown
 
-			if f.ts.After(displayEpoch) {
-				displayHits++
-				displayUp += f.up
-				displayDown += f.down
-				displayTotal += displayUp + displayDown
+			if f.timestamp.After(displayEpoch) {
+				row.DisplayHits++
+				row.DisplayUp += f.requestSize
+				row.DisplayDown += f.responseSize
+				row.DisplayTotal += row.DisplayUp + row.DisplayDown
 			}
 		}
 
-		row := display.Row{
-			Section: section,
-			Hits:    displayHits,
-			Up:      displayUp,
-			Down:    displayDown,
-			Total:   displayTotal,
+		if row.AlertHits == 0 {
+			break
 		}
 
-		if alertHits > s.AlertThreshold {
-			row.Alert = true
-			rows = append(rows, row)
-			continue
+		if row.AlertHits > s.AlertThreshold {
+			row.IsAlerting = true
 		}
-
-		if displayHits > 0 {
-			rows = append(rows, row)
-		}
+		rows = append(rows, row)
 	}
 
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Hits > rows[j].Hits })
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Alert && !rows[j].Alert })
-	return rows
+	sort.Slice(rows, func(i, j int) bool { return rows[i].DisplayHits > rows[j].DisplayHits })
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].IsAlerting && !rows[j].IsAlerting })
 
+	return Stats{
+		Global:   aggregate(rows),
+		Sections: rows,
+	}
+}
+
+func aggregate(rows []display.Row) display.Row {
+	ret := display.Row{Section: "global"}
+	for _, r := range rows {
+		ret.DisplayHits += r.DisplayHits
+		ret.DisplayUp += r.DisplayUp
+		ret.DisplayDown += r.DisplayDown
+		ret.DisplayTotal += r.DisplayTotal
+		ret.AlertHits += r.AlertHits
+		ret.AlertUp += r.AlertUp
+		ret.AlertDown += r.AlertDown
+		ret.AlertTotal += r.AlertTotal
+	}
+	return ret
 }
 
 func sectionFromHostPath(host, path string) string {
