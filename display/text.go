@@ -12,9 +12,10 @@ import (
 )
 
 type Text struct {
-	Output      io.WriteCloser
+	Output      io.Writer
 	alerts      map[string]alert
 	alertWindow time.Duration
+	clock       func() time.Time
 
 	sync.Mutex
 }
@@ -40,6 +41,7 @@ func NewText(opts Options) *Text {
 		Output:      os.Stdout,
 		alerts:      make(map[string]alert),
 		alertWindow: opts.AlertWindow,
+		clock:       time.Now,
 	}
 }
 
@@ -47,8 +49,8 @@ func (t *Text) Update(global Row, sections []Row) {
 	t.Lock()
 	defer t.Unlock()
 
-	now := time.Now()
-	fmt.Fprintf(os.Stdout, "HITS\tTotal\tDown\tUp\tSection\n")
+	now := t.clock()
+	fmt.Fprintf(t.Output, "HITS\tTotal\tDown\tUp\tSection\n")
 	fmt.Fprintln(t.Output, global)
 	var newAlerts []string
 	for _, r := range sections {
@@ -70,7 +72,7 @@ func (t *Text) Update(global Row, sections []Row) {
 	}
 
 	for _, a := range newAlerts {
-		fmt.Println(a)
+		fmt.Fprintln(t.Output, a)
 	}
 
 	for _, a := range t.removeRecoveredAlerts() {
@@ -81,7 +83,7 @@ func (t *Text) Update(global Row, sections []Row) {
 }
 
 func (t *Text) removeRecoveredAlerts() []alert {
-	now := time.Now()
+	now := t.clock()
 	var ret []alert
 	for section, alert := range t.alerts {
 		if now.Sub(alert.lastSeen) > t.alertWindow {
