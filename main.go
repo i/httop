@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"datadog-project/display"
+	"httop/display"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
