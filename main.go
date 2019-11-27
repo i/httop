@@ -117,41 +117,46 @@ func processRequests(r io.ReadCloser, ch chan *http.Request) {
 		}
 		if err != nil {
 			// possible malformed http request
-			tcpreader.DiscardBytesToEOF(r)
-			return
+			log.Printf("unexpected error: %v", err)
 		}
 		ch <- req
 	}
 }
 
 func handleUnexpectedResponse(r io.ReadCloser) {
-	// TODO any operation on r will block forever which blocks assembly for the
-	// rest of the streams.
 	return
 }
 
-func processResponses(r io.ReadCloser, ch chan *http.Request, roundTrips chan<- roundTripInfo) {
+func processResponses(r io.ReadCloser, requests chan *http.Request, roundTrips chan<- roundTripInfo) {
 	defer r.Close()
 
 	buf := bufio.NewReader(r)
 	for {
-		cw1, err := buf.WriteTo(ioutil.Discard)
+		resp, err := http.ReadResponse(buf, nil)
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
+			return
+		}
 		if err != nil {
+			log.Printf("unexpected error: %v", err)
+			return
+		}
+
+		req := <-requests
+		var responseSize, requestSize countWriter
+
+		if err := req.Write(&requestSize); err != nil {
 			panic(err)
 		}
 
-		request := <-ch
-		var cw countWriter
-
-		if err := request.Write(&cw); err != nil {
+		if err := resp.Write(&responseSize); err != nil {
 			panic(err)
 		}
 
 		roundTrips <- roundTripInfo{
-			host:         request.Host,
-			path:         request.URL.String(),
-			requestSize:  int(cw),
-			responseSize: int(cw1),
+			host:         req.Host,
+			path:         req.URL.String(),
+			requestSize:  int(requestSize),
+			responseSize: int(responseSize),
 			timestamp:    time.Now(),
 		}
 	}
@@ -292,9 +297,16 @@ func (s *Sniffer) startDisplayTimer() {
 	}
 }
 
+const maxDisplayRate = time.Second / 5
+
 func (s *Sniffer) displayLoop() {
+	last := time.Now()
 	for range s.displayTick {
+		if time.Since(last) < maxDisplayRate {
+			continue
+		}
 		s.showDisplay()
+		last = time.Now()
 	}
 }
 
@@ -309,6 +321,8 @@ type Stats struct {
 }
 
 func (s *Sniffer) collectStats() Stats {
+	s.Lock()
+	defer s.Unlock()
 	now := time.Now()
 	displayEpoch := now.Add(-s.DisplayWindow)
 	alertEpoch := now.Add(-s.AlertWindow)
